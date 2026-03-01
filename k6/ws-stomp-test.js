@@ -190,7 +190,8 @@ export default function () {
 
         // ── Step 5: JOIN ─────────────────────────────────────────
         socket.send(stompFrame('SEND', {
-          destination: '/app/room.join',
+          destination:    '/app/room.join',
+          'content-type': 'application/json',
         }, JSON.stringify({ roomId, userId })));
       }
 
@@ -202,13 +203,13 @@ export default function () {
         // Track round-trip for CHAT messages we sent
         try {
           const body = JSON.parse(frame.body);
-          if (body.sender === userId && sendTimestamps[body.content]) {
+          if (body.senderId === userId && sendTimestamps[body.content]) {
             msgRoundTrip.add(Date.now() - sendTimestamps[body.content]);
             delete sendTimestamps[body.content];
           }
 
           // After JOIN confirmation, start sending chat messages
-          if (!joined && body.type === 'JOIN' && body.sender === userId) {
+          if (!joined && body.type === 'JOIN' && body.senderId === userId) {
             joined = true;
             // ── Step 6: Send 20 messages (100ms apart) ────────────
             let i = 0;
@@ -216,7 +217,8 @@ export default function () {
               if (i >= MESSAGES_PER_VU) {
                 // ── Step 7: LEAVE ──────────────────────────────
                 socket.send(stompFrame('SEND', {
-                  destination: '/app/room.leave',
+                  destination:    '/app/room.leave',
+                  'content-type': 'application/json',
                 }, JSON.stringify({ roomId, userId })));
                 return;
               }
@@ -225,7 +227,7 @@ export default function () {
               socket.send(stompFrame('SEND', {
                 destination:   '/app/room.send',
                 'content-type': 'application/json',
-              }, JSON.stringify({ roomId, sender: userId, content, type: 'CHAT' })));
+              }, JSON.stringify({ roomId, senderId: userId, content, type: 'CHAT' })));
               msgSent.add(1);
               i++;
               socket.setTimeout(sendNext, 100);
@@ -234,7 +236,7 @@ export default function () {
           }
 
           // After LEAVE or ROOM_DELETED, close the connection
-          if (body.type === 'LEAVE' && body.sender === userId) {
+          if (body.type === 'LEAVE' && body.senderId === userId) {
             socket.close();
           }
           if (body.type === 'ROOM_DELETED') {
