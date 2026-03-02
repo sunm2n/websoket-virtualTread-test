@@ -66,6 +66,9 @@ export default function () {
   errorRate.add(createOk ? 0 : 1);
   if (!createOk) createErrors.add(1);
 
+  let roomId = null;
+  try { roomId = JSON.parse(createRes.body).roomId; } catch { /* ignore */ }
+
   // GET /api/rooms  (서버 50ms sleep)
   const listRes = http.get(`${BASE_URL}/api/rooms`);
 
@@ -74,6 +77,11 @@ export default function () {
   const listOk = check(listRes, { 'GET 200': (r) => r.status === 200 });
   errorRate.add(listOk ? 0 : 1);
   if (!listOk) listErrors.add(1);
+
+  // DELETE: 생성한 방을 즉시 삭제 → 방 목록 누적 방지 → GET 응답 크기 일정하게 유지
+  if (roomId) {
+    http.del(`${BASE_URL}/api/rooms/${roomId}?userId=${userId}`);
+  }
 }
 
 export function teardown() {
