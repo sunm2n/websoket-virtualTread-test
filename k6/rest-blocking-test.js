@@ -79,8 +79,11 @@ export default function () {
   if (!listOk) listErrors.add(1);
 
   // DELETE: 생성한 방을 즉시 삭제 → 방 목록 누적 방지 → GET 응답 크기 일정하게 유지
+  // name 태그로 URL의 고유 roomId를 그룹화하여 시계열 폭증 방지
   if (roomId) {
-    http.del(`${BASE_URL}/api/rooms/${roomId}?userId=${userId}`);
+    http.del(`${BASE_URL}/api/rooms/${roomId}?userId=${userId}`, null, {
+      tags: { name: 'DELETE /api/rooms/:id' },
+    });
   }
 }
 
