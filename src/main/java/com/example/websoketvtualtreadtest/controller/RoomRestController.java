@@ -14,6 +14,8 @@ import org.springframework.web.bind.annotation.*;
 import java.util.List;
 import java.util.UUID;
 
+// Simulates blocking I/O (e.g. DB query) to demonstrate Virtual Thread benefit
+
 @RestController
 @RequestMapping("/api/rooms")
 public class RoomRestController {
@@ -28,6 +30,7 @@ public class RoomRestController {
 
     @GetMapping
     public List<RoomResponse> listRooms() {
+        simulateDbRead();
         return store.getAllRooms().stream()
                 .map(RoomResponse::from)
                 .toList();
@@ -35,6 +38,7 @@ public class RoomRestController {
 
     @PostMapping
     public ResponseEntity<RoomResponse> createRoom(@RequestBody CreateRoomRequest req) {
+        simulateDbWrite();
         String roomId = UUID.randomUUID().toString();
         ChatRoom room = new ChatRoom(roomId, req.getRoomName(), req.getCreatorId());
         store.addRoom(room);
@@ -66,6 +70,16 @@ public class RoomRestController {
         broadcastRoomList();
 
         return ResponseEntity.noContent().build();
+    }
+
+    /** Simulates DB SELECT latency (e.g. simple read query) */
+    private void simulateDbRead() {
+        try { Thread.sleep(50); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+
+    /** Simulates DB INSERT + commit latency */
+    private void simulateDbWrite() {
+        try { Thread.sleep(100); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
     }
 
     private void broadcastRoomList() {
