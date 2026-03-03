@@ -346,3 +346,132 @@ k6 run k6/ws-load-test.js
 | `ReentrantLock` 유지 | `synchronized`는 Virtual Thread 핀닝 유발, `ReentrantLock`은 안전 |
 | k6 SockJS 직접 구현 | k6가 SockJS를 기본 지원하지 않으므로 프레임 파싱을 직접 구현 |
 | ramp-up 시나리오 | 풀 포화 임계점(HTTP 200, STOMP 기본값)을 자연스럽게 통과하도록 설계 |
+
+---
+
+## 7. 실제 테스트 결과 (REST, 1차)
+
+> 실행 환경: 로컬 macOS, k6 ramp-up 10→300 VUs / 50s, `k6/rest-load-test.js`
+
+### 7-1. Virtual Thread OFF (`spring.threads.virtual.enabled=false`)
+
+```
+get_rooms_duration   avg=147.78ms  p(90)=329.5ms   p(95)=387.63ms  max=753.38ms
+create_room_duration avg=189.03ms  p(90)=337.74ms  p(95)=381.83ms  max=687.52ms
+errors               0.00%
+iterations           58,194
+data_received        46 GB
+```
+
+### 7-2. Virtual Thread ON (`spring.threads.virtual.enabled=true`)
+
+```
+get_rooms_duration   avg=159.27ms  p(90)=290.77ms  p(95)=310.16ms  max=481.38ms
+create_room_duration avg=229.37ms  p(90)=422.82ms  p(95)=471.82ms  max=596.08ms
+errors               0.00%
+iterations           52,323
+data_received        38 GB
+```
+
+### 7-3. 결과 비교
+
+| 지표 | Virtual Thread OFF | Virtual Thread ON | 변화 |
+|------|--------------------|-------------------|------|
+| get p(95) | 387.63ms | 310.16ms | **▼ 77ms 개선** |
+| get max | 753.38ms | 481.38ms | **▼ 272ms 개선** |
+| threshold ✗ | p(95)=387ms (초과) | p(95)=310ms (초과) | 둘 다 기준 미달 |
+| 에러율 | 0% | 0% | 동일 |
+
+p(95) 기준으로 77ms 개선되어 Virtual Thread의 방향성은 확인됐다.
+그러나 ON 상태에서도 임계값(300ms)을 초과해 기대보다 차이가 작게 나타났다.
+
+### 7-4. 결과가 기대보다 작았던 원인
+
+**응답 크기 오염 문제**
+
+테스트 도중 POST 요청(20%)이 계속 방을 생성하고 삭제하지 않아서,
+시간이 갈수록 `GET /api/rooms`의 응답 바디가 커졌다.
+
+```
+테스트 시작: 방 5개 → GET 응답 수백 바이트
+테스트 후반: 방 수천 개 → GET 응답 수십 KB ~ 수백 KB
+              → data_received 46 GB (비정상)
+              → 후반부 latency가 스레드 포화가 아닌 응답 크기 때문에 상승
+```
+
+결과적으로 **스레드 포화 효과와 응답 크기 효과가 섞여서** ON/OFF 차이가 희석됐다.
+
+---
+
+## 8. 다음 개선 방향
+
+> 아래 항목을 이행하면 더 공정하고 명확한 ON/OFF 비교가 가능하다.
+
+### 개선 1. 테스트 격리: 방 생성/삭제 분리 (우선순위 높음)
+
+**문제:** POST가 테스트 내내 방을 쌓아 GET 응답이 커짐
+**해결:** `setup()`에서 방을 생성하고, `teardown()`에서 전부 삭제한다.
+메인 루프는 GET 전용 또는 고정된 방에만 POST하도록 분리한다.
+
+```javascript
+// k6/rest-load-test.js 개선안
+export function setup() {
+  // 방 1개만 생성하고 roomId 반환
+  const res = http.post(`${BASE_URL}/api/rooms`, ...);
+  return { roomId: res.json('roomId') };
+}
+
+export default function (data) {
+  // GET만 반복 (응답 크기 고정)
+  http.get(`${BASE_URL}/api/rooms`);
+}
+
+export function teardown(data) {
+  // 생성한 방 삭제
+  http.del(`${BASE_URL}/api/rooms/${data.roomId}?userId=admin`);
+}
+```
+
+### 개선 2. GET 전용 시나리오와 POST 전용 시나리오 분리
+
+**문제:** 80/20 비율로 섞으면 blocking 시간이 달라 결과 해석이 복잡해짐
+**해결:** 시나리오를 두 개로 나눠 각각 독립 측정한다.
+
+```javascript
+export const options = {
+  scenarios: {
+    read_load:  { executor: 'constant-vus', vus: 300, duration: '30s', exec: 'readScenario' },
+    write_load: { executor: 'constant-vus', vus: 100, duration: '30s', exec: 'writeScenario' },
+  },
+};
+```
+
+### 개선 3. WebSocket 테스트 실행
+
+현재 `ws-load-test.js`는 작성됐으나 roomId를 수동으로 교체해야 해서 실행이 번거롭다.
+**해결:** `setup()`에서 방을 동적으로 생성해 roomId를 자동으로 주입한다.
+
+```javascript
+export function setup() {
+  const res = http.post(`${BASE_URL}/api/rooms`,
+    JSON.stringify({ roomName: 'ws-test', creatorId: 'admin' }),
+    { headers: { 'Content-Type': 'application/json' } }
+  );
+  return { roomId: res.json('roomId') };
+}
+
+export default function (data) {
+  // data.roomId 사용 → ROOM_ID 하드코딩 제거
+}
+```
+
+### 개선 4. 임계값 재조정
+
+현재 `p(95) < 300ms` 기준은 응답 크기가 고정된 환경에서 설정된 값이다.
+개선 1~3 적용 후 실측값을 기반으로 현실적인 임계값으로 조정한다.
+
+| 시나리오 | 현재 임계값 | 개선 후 권장 임계값 |
+|---------|------------|-------------------|
+| GET (50ms blocking) | p(95) < 300ms | 개선 후 실측 기반 재설정 |
+| POST (100ms blocking) | 없음 | 개선 후 추가 |
+| WebSocket RTT | p(95) < 500ms | 개선 후 실측 기반 재설정 |
