@@ -29,6 +29,7 @@ public class ChatMessageController {
 
     @MessageMapping("/room.join")
     public void joinRoom(@Payload JoinRoomPayload payload, SimpMessageHeaderAccessor headerAccessor) {
+        simulateDbRead(); // 참여 가능 여부 조회 시뮬레이션
         String roomId = payload.getRoomId();
         String userId = payload.getUserId();
 
@@ -61,6 +62,7 @@ public class ChatMessageController {
 
     @MessageMapping("/room.send")
     public void sendMessage(@Payload ChatMessage message) {
+        simulateDbWrite(); // 메시지 저장 시뮬레이션
         ChatRoom room = store.getRoom(message.getRoomId());
         if (room == null) return;
         message.setType(MessageType.CHAT);
@@ -90,5 +92,15 @@ public class ChatMessageController {
                 .map(RoomResponse::from)
                 .toList();
         messaging.convertAndSend("/topic/rooms", rooms);
+    }
+
+    /** 참여 가능 여부 DB 조회 시뮬레이션 (50ms) */
+    private void simulateDbRead() {
+        try { Thread.sleep(50); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+
+    /** 메시지 DB 저장 시뮬레이션 (100ms) */
+    private void simulateDbWrite() {
+        try { Thread.sleep(100); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
     }
 }
