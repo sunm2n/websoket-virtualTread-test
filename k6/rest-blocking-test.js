@@ -1,16 +1,15 @@
 /**
- * k6 REST Blocking I/O Load Test
+ * k6 REST Blocking I/O Load Test — 시나리오 분리 버전
  *
  * 목적: Thread.sleep으로 DB I/O를 시뮬레이션하여
  *       플랫폼 쓰레드 vs 버추얼 쓰레드 성능 차이를 수치화
  *
- * 핵심 원리:
- *   - GET  /api/rooms → 서버에서 50ms sleep  (SELECT 시뮬)
- *   - POST /api/rooms → 서버에서 100ms sleep (INSERT 시뮬)
- *   - 600 VU 동시 접속 → Tomcat 기본 쓰레드 풀(200개) 3배 초과
+ * 시나리오:
+ *   - read_load:  GET /api/rooms 반복 (순수 읽기 성능 측정, 서버 50ms sleep)
+ *   - write_load: POST /api/rooms → DELETE 사이클 (쓰기 성능 측정, 서버 100ms sleep, 방 누적 방지)
  *
- * 플랫폼 쓰레드: 200개 쓰레드 포화 → 나머지 큐 대기 → 레이턴시 폭증
- * 버추얼 쓰레드: sleep 중 carrier thread 반납 → 제한 없이 처리 → 레이턴시 유지
+ * setup()에서 시드 방 5개를 생성하여 GET 응답 크기를 일정하게 유지하고,
+ * teardown()에서 시드 방을 삭제한다.
  *
  * Run:
  *   # 1단계: application.properties에서 spring.threads.virtual.enabled=true 주석 처리 후 실행
@@ -33,27 +32,77 @@ const createLatency = new Trend('create_latency_ms', true);
 const listLatency   = new Trend('list_latency_ms', true);
 
 export const options = {
-  stages: [
-    { duration: '20s', target: 100 }, // warmup
-    { duration: '30s', target: 300 }, // 300 VU: 플랫폼 쓰레드 풀(200) 초과 시작
-    { duration: '30s', target: 600 }, // 600 VU: 풀 3배 → 포화 확정
-    { duration: '60s', target: 600 }, // 60s 유지: 포화 상태 지속 측정
-    { duration: '20s', target: 0   }, // ramp-down
-  ],
+  scenarios: {
+    read_load: {
+      executor: 'ramping-vus',
+      startVUs: 10,
+      stages: [
+        { duration: '20s', target: 300 },
+        { duration: '60s', target: 600 },
+        { duration: '20s', target: 0 },
+      ],
+      exec: 'readScenario',
+    },
+    write_load: {
+      executor: 'ramping-vus',
+      startVUs: 5,
+      stages: [
+        { duration: '20s', target: 100 },
+        { duration: '60s', target: 200 },
+        { duration: '20s', target: 0 },
+      ],
+      exec: 'writeScenario',
+    },
+  },
   thresholds: {
-    // 플랫폼 쓰레드 모드에서는 이 임계값을 초과할 것으로 예상
-    // 버추얼 쓰레드 모드에서는 통과할 것으로 예상
     error_rate:        ['rate<0.01'],
-    create_latency_ms: ['p(99)<500'],  // 100ms sleep + 여유 400ms
-    list_latency_ms:   ['p(99)<300'],  // 50ms sleep + 여유 250ms
+    list_latency_ms:   ['p(95)<200'],   // 50ms sleep + 여유 150ms
+    create_latency_ms: ['p(95)<300'],   // 100ms sleep + 여유 200ms
   },
 };
 
-export default function () {
+/**
+ * setup: 시드 방 5개 생성 → GET 응답 크기 일정하게 유지
+ */
+export function setup() {
+  const seedRooms = [];
+  for (let i = 0; i < 5; i++) {
+    const res = http.post(
+      `${BASE_URL}/api/rooms`,
+      JSON.stringify({ roomName: `seed-room-${i}`, creatorId: 'admin' }),
+      { headers: { 'Content-Type': 'application/json' } },
+    );
+    if (res.status === 201) {
+      try {
+        seedRooms.push(JSON.parse(res.body).roomId);
+      } catch { /* ignore */ }
+    }
+  }
+  console.log(`[setup] Created ${seedRooms.length} seed rooms: ${JSON.stringify(seedRooms)}`);
+  return { seedRooms };
+}
+
+/**
+ * readScenario: GET /api/rooms 반복 (순수 읽기 성능 측정)
+ */
+export function readScenario(_data) {
+  const res = http.get(`${BASE_URL}/api/rooms`);
+
+  listLatency.add(res.timings.duration);
+
+  const ok = check(res, { 'GET 200': (r) => r.status === 200 });
+  errorRate.add(ok ? 0 : 1);
+  if (!ok) listErrors.add(1);
+}
+
+/**
+ * writeScenario: POST → DELETE 사이클 (쓰기 성능 측정, 방 누적 방지)
+ */
+export function writeScenario(_data) {
   const vuId   = __VU;
   const userId = `user-${vuId}`;
 
-  // POST /api/rooms  (서버 100ms sleep)
+  // POST /api/rooms (서버 100ms sleep)
   const createRes = http.post(
     `${BASE_URL}/api/rooms`,
     JSON.stringify({ roomName: `room-vu${vuId}-${Date.now()}`, creatorId: userId }),
@@ -66,20 +115,10 @@ export default function () {
   errorRate.add(createOk ? 0 : 1);
   if (!createOk) createErrors.add(1);
 
+  // DELETE: 생성한 방 즉시 삭제 → 방 누적 방지
   let roomId = null;
   try { roomId = JSON.parse(createRes.body).roomId; } catch { /* ignore */ }
 
-  // GET /api/rooms  (서버 50ms sleep)
-  const listRes = http.get(`${BASE_URL}/api/rooms`);
-
-  listLatency.add(listRes.timings.duration);
-
-  const listOk = check(listRes, { 'GET 200': (r) => r.status === 200 });
-  errorRate.add(listOk ? 0 : 1);
-  if (!listOk) listErrors.add(1);
-
-  // DELETE: 생성한 방을 즉시 삭제 → 방 목록 누적 방지 → GET 응답 크기 일정하게 유지
-  // name 태그로 URL의 고유 roomId를 그룹화하여 시계열 폭증 방지
   if (roomId) {
     http.del(`${BASE_URL}/api/rooms/${roomId}?userId=${userId}`, null, {
       tags: { name: 'DELETE /api/rooms/:id' },
@@ -87,12 +126,26 @@ export default function () {
   }
 }
 
-export function teardown() {
+/**
+ * teardown: 시드 방 삭제 + JVM 쓰레드 수 출력
+ */
+export function teardown(data) {
+  // 시드 방 삭제
+  if (data.seedRooms) {
+    for (const roomId of data.seedRooms) {
+      http.del(`${BASE_URL}/api/rooms/${roomId}?userId=admin`, null, {
+        tags: { name: 'DELETE /api/rooms/:id' },
+      });
+    }
+    console.log(`[teardown] Deleted ${data.seedRooms.length} seed rooms`);
+  }
+
+  // Actuator 쓰레드 수 출력
   const res = http.get(`${BASE_URL}/actuator/metrics/jvm.threads.live`);
   if (res.status === 200) {
     try {
-      const data  = JSON.parse(res.body);
-      const value = data.measurements.find((m) => m.statistic === 'VALUE');
+      const metrics = JSON.parse(res.body);
+      const value = metrics.measurements.find((m) => m.statistic === 'VALUE');
       console.log(`\n[Actuator] JVM live threads at end of test: ${value ? value.value : 'N/A'}`);
     } catch {
       console.log('[Actuator] Failed to parse thread metrics');
